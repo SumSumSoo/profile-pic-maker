@@ -1,4 +1,14 @@
 'use client';
+import { FunnelEvent, trackEvent } from '@/lib/analytics';
+import {
+  leaderboardEnabled,
+  readReferralCode,
+  referrerProp,
+  rememberReferrer,
+} from '@/lib/referral';
+import { readMyPromoter, type MyPromoter } from '@/lib/my-promoter';
+import { SHORT_URL_LABEL } from '@/lib/share';
+import { assignShareVariant, type ShareVariant } from '@/lib/share-variant';
 import { SocialPlatform } from '@/types';
 import download from 'downloadjs';
 import { toPng } from 'html-to-image';
@@ -13,36 +23,124 @@ import {
   FaBluesky,
 } from 'react-icons/fa6';
 
+import { FEATURED_FAQ_ENTRIES } from '@/lib/faq';
+import Link from 'next/link';
+
+import BrandingRing from './branding-ring';
+import { BRANDS, type Brand, type BrandText } from './brands';
+import FaqList from './faq';
+import MyLinkCard from './my-link-card';
+import FramedPhoto, {
+  DEFAULT_FIT,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  type PhotoFit,
+} from './framed-photo';
+import SharePanel from './share-panel';
+import SurveyPanel from './survey-panel';
+
 export default function Home() {
   const ref = useRef<HTMLDivElement>(null);
   const [userImageUrl, setUserImageUrl] = useState<string>();
-  const [unsuportedBrowser, setUnsupportedBrowser] = useState(false);
+  const [unsupportedBrowser, setUnsupportedBrowser] = useState(false);
   const [loader, setLoader] = useState(false);
   const [gazaStatusSummary, setGazaStatusSummary] = useState();
+  const [hasDownloaded, setHasDownloaded] = useState(false);
+  // Off by default: the picture is the user's, so the address only goes on it
+  // if they ask for it. One click adds it.
+  const [showBranding, setShowBranding] = useState(false);
+  // Co-branding (`?b=<code>`, see `@/lib/brands`): the brand the link unlocked,
+  // on by default since the person came for it, and replacing the short URL,
+  // since both sit on the ring's bottom arc.
+  const [brand, setBrand] = useState<{ id: string; text: BrandText } & Brand>();
+  const [showBrand, setShowBrand] = useState(true);
+  const activeBrand = showBrand ? brand : undefined;
+  const overlay = activeBrand ? (
+    <activeBrand.Overlay text={activeBrand.text} />
+  ) : (
+    showBranding && <BrandingRing />
+  );
+  // Where the photo sits in the circle (see `./framed-photo`), so a tight crop
+  // can clear the brand's overlay. Only adjustable on a co-brand link.
+  const [fit, setFit] = useState<PhotoFit>(DEFAULT_FIT);
+  const [variant, setVariant] = useState<ShareVariant>('classic');
+  // Link-first only: the link this browser already has, shown at the top on
+  // a return visit so the person sees what it has done since.
+  const [myLink, setMyLink] = useState<MyPromoter>();
   const [filePostfix, setFilePostfix] = useState<
     SocialPlatform | 'user-upload'
   >();
+
+  useEffect(() => {
+    // A referral link (`?ref=<code>`) credits its promoter for this browser's
+    // downloads for the next 30 days, first touch wins (see `@/lib/referral`).
+    const code = readReferralCode(window.location.search);
+    if (code) rememberReferrer(code);
+    // Assigned on landing so every step of the funnel carries it.
+    const assigned = assignShareVariant({ search: window.location.search });
+    // localStorage is browser-only, so both are settled after hydration.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setVariant(assigned);
+    if (assigned === 'link-first') setMyLink(readMyPromoter());
+    const brandCode = new URLSearchParams(window.location.search).get('b');
+    if (brandCode) {
+      fetch(`/api/brand?code=${encodeURIComponent(brandCode)}`)
+        .then((res) => (res.ok ? res.json() : undefined))
+        .then((link?: { brand: string; text: Record<string, string> }) => {
+          const found = link ? BRANDS[link.brand] : undefined;
+          if (!found) return;
+          // The secret's text overrides the brand's defaults, key by key.
+          const text = { ...found.text, ...link!.text };
+          setBrand({ ...found, id: link!.brand, text });
+        })
+        // Unknown or retired code, or offline: the plain frame.
+        .catch(() => {});
+    }
+    trackEvent(FunnelEvent.Landed, {
+      referrer: referrerProp(),
+      variant: assigned,
+    });
+  }, []);
+
+  // Step 4: a usable image source (data URL / social profile URL) is obtained.
+  useEffect(() => {
+    if (userImageUrl) {
+      trackEvent(FunnelEvent.PhotoFetched, {
+        method: filePostfix ?? 'unknown',
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userImageUrl]);
 
   useEffect(() => {
     const isInstagramBrowser = /Instagram/i.test(navigator.userAgent);
     const isFacebookBrowser = /FBAN|FBAV/i.test(navigator.userAgent);
 
     if (isInstagramBrowser || isFacebookBrowser) {
+      // Browser detection must happen in an effect (navigator unavailable during SSR).
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setUnsupportedBrowser(true);
     }
-  }, [unsuportedBrowser]);
+  }, []);
 
   useEffect(() => {
     fetch('/api/gaza-status')
-      .then((res) => res.json())
-      .then((data) => setGazaStatusSummary(data.summary));
-  }, [gazaStatusSummary]);
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setGazaStatusSummary(data?.summary))
+      .catch((error) => {
+        // The Gaza status banner is non-essential. Swallow network failures
+        // here so they don't bubble up as an unhandled "Failed to fetch" /
+        // "Load failed" rejection (Sentry PPM-8 / PPM-A).
+        console.error('Error fetching Gaza status summary:', error);
+      });
+  }, []);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file: File | undefined = e.target.files?.[0];
     const reader = new FileReader();
 
     if (file) {
+      trackEvent(FunnelEvent.PhotoProvided, { method: 'user-upload' });
       reader.onload = async (event: ProgressEvent<FileReader>) => {
         setFilePostfix('user-upload');
         setUserImageUrl(event.target?.result as string);
@@ -56,13 +154,16 @@ export default function Home() {
   };
 
   const handleUploadButtonClick = () => {
+    trackEvent(FunnelEvent.SourceSelected, { method: 'user-upload' });
     document.getElementById('fileInput')?.click();
   };
 
   const handleRetrieveProfilePicture = async (platform: SocialPlatform) => {
+    trackEvent(FunnelEvent.SourceSelected, { method: platform });
     const userProvidedUsername = prompt(`Enter your ${platform} username:`);
 
     if (userProvidedUsername) {
+      trackEvent(FunnelEvent.PhotoProvided, { method: platform });
       setFilePostfix(platform);
       try {
         setLoader(true);
@@ -85,31 +186,54 @@ export default function Home() {
 
   const generateImage = async () => {
     try {
-      return await toPng(ref.current as HTMLElement);
+      // includeQueryParams keeps html-to-image's per-resource cache keyed by the
+      // full URL. Social avatars all render through the next/image optimizer as
+      // `/_next/image?url=...`; without the query params every avatar collapses
+      // to the same cache key, so after "Start Over" a second avatar would be
+      // rasterised from the first one's cached bytes (issue #35).
+      return await toPng(ref.current as HTMLElement, {
+        includeQueryParams: true,
+      });
     } catch (error) {
       console.log('Error generating image', error);
     }
   };
 
-  const handleDownload = async () => {
+  const generateFinalImage = async () => {
     // TODO: Fix if possible. This is a hack to ensure that image generated is as expected. Without repeating generateImage(), at times, the image wont be generated correctly.
     await generateImage();
     await generateImage();
     await generateImage();
-    const generatedImageUrl = await generateImage();
+    return generateImage();
+  };
+
+  const handleDownload = async () => {
+    const generatedImageUrl = await generateFinalImage();
     if (generatedImageUrl) {
       download(generatedImageUrl, `profile-pic-${filePostfix}.png`);
+      trackEvent(FunnelEvent.Downloaded, {
+        method: filePostfix ?? 'unknown',
+        branding: showBranding && !activeBrand ? 'on' : 'off',
+        cobrand: activeBrand?.id ?? 'off',
+        adjusted: fit === DEFAULT_FIT ? 'off' : 'on',
+        referrer: referrerProp(),
+        variant,
+      });
+      setHasDownloaded(true);
     }
   };
 
   const startOver = async () => {
+    trackEvent(FunnelEvent.StartOver, { method: filePostfix ?? 'unknown' });
     setUserImageUrl(undefined);
+    setHasDownloaded(false);
+    setFit(DEFAULT_FIT);
   };
 
   return (
-    <main className="text-center px-8 py-12 max-w-xl mx-auto flex justify-center align-center items-center min-h-screen">
-      <div>
-        {unsuportedBrowser && (
+    <main className="min-h-screen flex flex-col text-center">
+      <div className="flex-1 flex flex-col justify-center px-8 py-12 max-w-xl mx-auto w-full">
+        {unsupportedBrowser && (
           <div className="border p-2 rounded-lg bg-yellow-200 my-2  text-sm mb-8">
             <p className="font-semibold">⚠️ Unsupported Browser Detected</p>
             <p>Please open on regular browsers like Chrome or Safari.</p>
@@ -131,7 +255,7 @@ export default function Home() {
         <p className="text-gray-600">
           Watch the{' '}
           <a
-            href="https://www.instagram.com/p/C2B1DP0LqBl/"
+            href="/how-to-guide.mp4"
             target="_blank"
             className="underline cursor-pointer hover:text-gray-900"
           >
@@ -139,6 +263,11 @@ export default function Home() {
           </a>{' '}
           👀
         </p>
+        {myLink && !userImageUrl && (
+          <div className="mt-6">
+            <MyLinkCard promoter={myLink} placement="return" />
+          </div>
+        )}
         <div className="my-12">
           <div className="flex justify-center">
             <div
@@ -146,7 +275,6 @@ export default function Home() {
               className="relative"
               ref={ref}
             >
-              {/* eslint-disable-next-line */}
               <Image
                 width={100}
                 height={100}
@@ -174,31 +302,102 @@ export default function Home() {
                   className="object-cover rounded-full cursor-wait"
                 />
               ) : (
-                <Image
+                <FramedPhoto
                   id="userImage"
-                  alt="profile-image"
                   src={userImageUrl ?? '/user.jpg'}
-                  width={100}
-                  height={100}
-                  style={{
-                    position: 'absolute',
-                    width: '85%',
-                    height: '85%',
-                    left: '7.5%',
-                    top: '7.5%',
+                  fit={fit}
+                  onFitChange={userImageUrl && brand ? setFit : undefined}
+                  onLoad={() => {
+                    // Only the user's selected photo counts, not the placeholder.
+                    if (userImageUrl) {
+                      trackEvent(FunnelEvent.PreviewShown, {
+                        method: filePostfix ?? 'unknown',
+                      });
+                    }
                   }}
-                  className="object-cover rounded-full cursor-pointer"
                 />
               )}
+              {!loader && overlay}
             </div>
           </div>
+          {userImageUrl && brand && (
+            <div className="mt-4 text-sm text-gray-600">
+              <label className="flex items-center justify-center gap-3">
+                Zoom
+                <input
+                  type="range"
+                  min={MIN_ZOOM}
+                  max={MAX_ZOOM}
+                  step={0.01}
+                  value={fit.zoom}
+                  onChange={(e) =>
+                    setFit({ ...fit, zoom: Number(e.target.value) })
+                  }
+                  className="w-40 accent-gray-900"
+                />
+              </label>
+              <p className="mt-1">Drag the photo to move it.</p>
+            </div>
+          )}
         </div>
         <div>
           {userImageUrl ? (
             <>
-              <p className="p-2 my-6 text-sm border rounded-lg">
-                Download the image, then use it as your new profile picture.
-              </p>
+              {hasDownloaded ? (
+                <SharePanel
+                  userImageUrl={userImageUrl}
+                  method={filePostfix ?? 'unknown'}
+                  generateProfileImage={generateFinalImage}
+                  overlay={overlay}
+                  fit={fit}
+                  variant={variant}
+                />
+              ) : (
+                <p className="p-2 my-6 text-sm border rounded-lg">
+                  Download the image, then use it as your new profile picture.
+                </p>
+              )}
+              {brand && (
+                <label className="flex items-start gap-3 mb-3 p-3 text-left text-sm border rounded-lg cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showBrand}
+                    onChange={(e) => setShowBrand(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-gray-900"
+                  />
+                  <span>
+                    <span className="font-semibold">{brand.text.label}</span>
+                    <span className="block text-gray-600">
+                      {brand.text.hint}
+                    </span>
+                  </span>
+                </label>
+              )}
+              {!activeBrand && (
+                <label className="flex items-start gap-3 mb-3 p-3 text-left text-sm border rounded-lg cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showBranding}
+                    onChange={(e) => {
+                      setShowBranding(e.target.checked);
+                      trackEvent(FunnelEvent.BrandingToggled, {
+                        branding: e.target.checked ? 'on' : 'off',
+                        method: filePostfix ?? 'unknown',
+                      });
+                    }}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-gray-900"
+                  />
+                  <span>
+                    <span className="font-semibold">
+                      Add {SHORT_URL_LABEL} to the frame
+                    </span>
+                    <span className="block text-gray-600">
+                      So everyone who sees your picture knows where to make
+                      theirs.
+                    </span>
+                  </span>
+                </label>
+              )}
               <button
                 onClick={handleDownload}
                 className="rounded-full mb-2 py-3 px-2 w-full border border-gray-900 bg-gray-900 text-white text-xl"
@@ -213,6 +412,11 @@ export default function Home() {
                 Start Over{' '}
                 <FaArrowRotateLeft className="inline mb-1 ml-2 text-md" />
               </button>
+              {/* Asked only after the picture is in hand, and below the share
+                  and download buttons so it never competes with them. */}
+              {hasDownloaded && (
+                <SurveyPanel method={filePostfix ?? 'unknown'} />
+              )}
             </>
           ) : (
             <>
@@ -266,32 +470,60 @@ export default function Home() {
         </div>
         <div className="pt-8">
           <p className="p-2 my-6 text-sm border rounded-lg">
-            Note: This app runs purely on your browser end. No images nor data
-            will be saved by the app.
+            Note: Your image is processed entirely in your browser. No images
+            are uploaded or saved by the app.
           </p>
           <p className="text-gray-600">
-            Have any feedback?{' '}
+            Have feedback, a question, or found a bug?{' '}
             <a
-              href="https://www.x.com/sohafidz"
+              href="https://github.com/TechForPalestine/profile-pic-maker/issues"
               target="_blank"
               className="underline cursor-pointer"
             >
-              Let me know!
-            </a>
-          </p>
-          <p className="text-gray-600">
-            For any bugs, please report them to our{' '}
-            <a
-              href="https://github.com/TechForPalestine/palestine-pfp-maker/issues"
-              target="_blank"
-              className="underline cursor-pointer"
-            >
-              {' '}
-              GitHub repository.
+              Let us know on GitHub
             </a>
           </p>
         </div>
+        <section aria-labelledby="faq-heading" className="pt-8">
+          <h2 id="faq-heading" className="text-2xl font-bold mb-4">
+            Frequently Asked Questions
+          </h2>
+          <FaqList entries={FEATURED_FAQ_ENTRIES} />
+          <p className="mt-4 flex flex-wrap justify-center gap-x-6 gap-y-1">
+            <Link href="/faq" className="underline text-gray-600">
+              Read all FAQs
+            </Link>
+            {leaderboardEnabled() && (
+              <Link href="/leaderboard" className="underline text-gray-600">
+                See the promoter leaderboard
+              </Link>
+            )}
+          </p>
+        </section>
       </div>
+      <footer className="bg-[#303846] text-center py-8 px-4">
+        <div className="container max-w-xl mx-auto">
+          <div className="mb-4">
+            <a
+              href="https://techforpalestine.org"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-block"
+            >
+              <img
+                src="/img/logo.svg"
+                alt="Tech For Palestine Logo"
+                width={320}
+                height={180}
+                className="mx-auto"
+              />
+            </a>
+          </div>
+          <p className="text-sm text-[#ebedf0]">
+            An open source initiative of the Tech For Palestine collective
+          </p>
+        </div>
+      </footer>
     </main>
   );
 }
